@@ -1,0 +1,29 @@
+# 统一换行符，避免 Windows/macOS/Linux 协作时整文件 diff
+* text=auto eol=lf
+
+# Go 源码
+*.go    text eol=lf
+
+# 前端源码与配置
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows 脚本保留 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制文件不做换行符转换
+*.png   binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.woff  binary
+*.woff2 binary

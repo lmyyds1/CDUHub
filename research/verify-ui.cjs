@@ -1,0 +1,41 @@
+// Run against a started local web server. Set PLAYWRIGHT_MODULE when using a bundled runtime.
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+
+(async () => {
+  const browser = await chromium.launch({ channel: 'msedge', headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1050 }, deviceScaleFactor: 1 });
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('http://127.0.0.1:8080', { waitUntil: 'networkidle' });
+  await page.locator('.article-row').first().waitFor();
+  assert.ok(await page.locator('.article-row').count() > 0, 'Real articles should render');
+  await page.screenshot({ path: path.join(__dirname, 'website-desktop.png'), fullPage: false });
+  const search = page.locator('input[type="search"]').first();
+  await search.fill('计算机');
+  await page.waitForTimeout(400);
+  assert.ok(await page.locator('.article-row').count() > 0, 'Search should return matching real articles');
+  await search.fill('不存在的测试词_NO_RESULT_854721');
+  await page.waitForTimeout(250);
+  assert.equal(await page.locator('.article-row').count(), 0, 'Unmatched search must show empty state');
+  await search.fill('');
+  await page.locator('.bookmark-button').first().click();
+  assert.ok((await page.evaluate(() => JSON.parse(localStorage.getItem('cdu-bookmarks-v1')))).length === 1);
+  await page.locator('.bookmark-button').first().click();
+  await page.getByRole('button', { name: '同步管理', exact: true }).first().click();
+  await page.getByRole('dialog').waitFor();
+  assert.equal(await page.locator('input[type="number"]').count(), 2);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '来源目录', exact: true }).first().click();
+  await page.locator('.source-card').first().waitFor();
+  assert.equal(await page.locator('.source-card').count(), 73);
+  await page.screenshot({ path: path.join(__dirname, 'website-sources.png'), fullPage: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: path.join(__dirname, 'website-mobile.png'), fullPage: false });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'Mobile must not overflow horizontally');
+  assert.deepEqual(errors, [], 'Browser should have no runtime exceptions');
+  console.log('PASS: real data, keyword search, empty state, bookmarks, sync dialog, 73 sources, mobile layout; no JS errors.');
+  await browser.close();
+})().catch(error => { console.error(error); process.exit(1); });

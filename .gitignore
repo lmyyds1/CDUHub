@@ -1,0 +1,53 @@
+# ── Go 构建产物 ─────────────────────────────────────────────
+/build/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.syso
+*.test
+*.out
+
+# Go 构建缓存（项目内自建缓存目录）
+/.cache/
+
+# ── 本地运行数据 ────────────────────────────────────────────
+# 采集到的时间点快照 / 数据库，可由程序重新生成，且体积较大
+/data/
+
+# ── 前端 ────────────────────────────────────────────────────
+/frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+/frontend/tsconfig.tsbuildinfo
+/frontend/package.json.md5
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# ── Wails 打包 / 发布产物 ───────────────────────────────────
+/build/*.zip
+/build/*.dmg
+/build/*.AppImage
+/release/
+/dist/
+
+# ── 编辑器与 IDE ────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ── 操作系统 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 日志与临时文件 ──────────────────────────────────────────
+*.log
+*.tmp
+*.pid
+/tmp/
