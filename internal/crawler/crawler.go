@@ -24,7 +24,12 @@ const (
 	maxBodyBytes        = 4 << 20
 	defaultPages        = 2
 	defaultChannels     = 40
-	detailBudget        = 12
+	// detailBudget caps detail-page enrichment per source. The old value (12)
+	// left most undated records and every wrong list date untouched; the list
+	// pages of a normal department carry 20-40 rows, so the budget must at least
+	// cover one full column. It is also capped by the article count in
+	// detailCandidates.
+	detailBudget = 40
 )
 
 type Crawler struct {
@@ -261,20 +266,12 @@ func (c *Crawler) CrawlSource(ctx context.Context, source model.Source, opts mod
 			raw = nextPage(pageDoc, final)
 		}
 	}
-	// A small shared budget enriches full dates/titles without fetching every article body.
-	indices := make([]int, 0)
-	for i, article := range articles {
-		if article.Date == "" || strings.Contains(article.Title, "...") || strings.Contains(article.Title, "…") {
-			indices = append(indices, i)
-		}
-	}
-	sort.SliceStable(indices, func(i, j int) bool {
-		truncated := func(s string) bool { return strings.Contains(s, "...") || strings.Contains(s, "…") }
-		return truncated(articles[indices[i]].Title) && !truncated(articles[indices[j]].Title)
-	})
-	if len(indices) > detailBudget {
-		indices = indices[:detailBudget]
-	}
+	// Detail pages are fetched for two reasons: a record without a full date or
+	// with a truncated headline needs enrichment, and a record whose date came
+	// from list-row aggregation may be wrong (journal.cdu.edu.cn reported sibling
+	// summary dates). The second group is only corrected when the detail page
+	// carries an explicit publication marker, see the worker below.
+	indices := detailCandidates(articles)
 	var wg sync.WaitGroup
 	jobs := make(chan int)
 	var detailMu sync.Mutex
@@ -284,19 +281,30 @@ func (c *Crawler) CrawlSource(ctx context.Context, source model.Source, opts mod
 			defer wg.Done()
 			for index := range jobs {
 				a := &articles[index]
+				hadDate := a.Date != ""
+				truncatedTitle := strings.Contains(a.Title, "...") || strings.Contains(a.Title, "…")
 				detail, _, fetchErr := c.fetch(ctx, a.URL)
 				if fetchErr != nil {
-					detailMu.Lock()
-					warnings = append(warnings, fmt.Sprintf("详情补全（%s）：%v", a.URL, fetchErr))
-					detailMu.Unlock()
+					// A failed fetch only matters when the record actually needs the
+					// detail page. The extra correction fetches below are best effort:
+					// the list date simply stays in place.
+					if !hadDate || truncatedTitle {
+						detailMu.Lock()
+						warnings = append(warnings, fmt.Sprintf("详情补全（%s）：%v", a.URL, fetchErr))
+						detailMu.Unlock()
+					}
 					continue
 				}
-				title, date, original := detailMetadata(detail)
-				if title != "" {
-					a.Title = title
+				info := detailMetadataInfo(detail)
+				if info.Title != "" {
+					a.Title = info.Title
 				}
-				if date != "" {
-					a.Date, a.DateText = date, original
+				// A missing list date is always worth filling, but an existing date
+				// may only be replaced by explicit publication metadata. Otherwise a
+				// headline/body date or an unreachable detail page would downgrade a
+				// correct list date.
+				if info.Date != "" && (!hadDate || info.DateExplicit) {
+					a.Date, a.DateText = info.Date, info.DateText
 				}
 				if content := detailContent(detail); len(content) > len(a.Content) {
 					a.Content = content
@@ -324,10 +332,47 @@ func (c *Crawler) CrawlSource(ctx context.Context, source model.Source, opts mod
 			source.Status = "partial"
 		}
 		if len(warnings) > 8 {
-			warnings = append(warnings[:8], fmt.Sprintf("另有 %d 项访问错误", len(warnings)-8))
+			// Copy before truncating: append on warnings[:8] would overwrite the
+			// ninth underlying element instead of adding a summary line.
+			summarised := append([]string{}, warnings[:8]...)
+			warnings = append(summarised, fmt.Sprintf("另有 %d 项访问错误", len(warnings)-8))
 		}
 		source.Error = strings.Join(warnings, "；")
 		return source, articles, errors.New(source.Error)
 	}
 	return source, articles, nil
+}
+
+// detailCandidates returns the article indices worth a detail-page fetch, capped
+// by detailBudget. Truncated headlines come first (the fetch restores the full
+// headline too), then undated records, then records that already carry a date:
+// that last group is fetched because a list-row date may belong to a neighbouring
+// row, but its date is only replaced by explicit publication metadata.
+func detailCandidates(articles []model.Article) []int {
+	truncated := func(s string) bool { return strings.Contains(s, "...") || strings.Contains(s, "…") }
+	group := func(a model.Article) int {
+		switch {
+		case truncated(a.Title):
+			return 0
+		case a.Date == "":
+			return 1
+		default:
+			return 2
+		}
+	}
+	indices := make([]int, 0, len(articles))
+	for i := range articles {
+		indices = append(indices, i)
+	}
+	sort.SliceStable(indices, func(i, j int) bool {
+		return group(articles[indices[i]]) < group(articles[indices[j]])
+	})
+	budget := detailBudget
+	if len(articles) < budget {
+		budget = len(articles)
+	}
+	if len(indices) > budget {
+		indices = indices[:budget]
+	}
+	return indices
 }

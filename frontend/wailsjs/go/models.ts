@@ -11,7 +11,6 @@ export namespace model {
 	    channel: string;
 	    date: string;
 	    dateText: string;
-	    dateInferred: boolean;
 	    fetchedAt: string;
 	
 	    static createFrom(source: any = {}) {
@@ -30,7 +29,6 @@ export namespace model {
 	        this.channel = source["channel"];
 	        this.date = source["date"];
 	        this.dateText = source["dateText"];
-	        this.dateInferred = source["dateInferred"];
 	        this.fetchedAt = source["fetchedAt"];
 	    }
 	}

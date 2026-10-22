@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import Icon from './Icon'
 import type { IconName } from './Icon'
@@ -11,6 +11,8 @@ type SearchMode = 'contains' | 'fuzzy' | 'smart'
 type Modal = 'sync' | 'about' | null
 const PAGE_SIZE = 15
 const number = new Intl.NumberFormat('zh-CN')
+// 共享 collator：避免每次比较都新建 Intl.Collator（全量 1.8 万条排序的主要开销）。
+const zhCollator = new Intl.Collator('zh-CN')
 const statusLabels: Record<Source['status'], string> = {
   pending: '等待同步', success: '同步正常', empty: '未识别到文章', ok: '同步正常', partial: '部分完成', error: '同步失败', unavailable: '暂无公开站点',
 }
@@ -59,9 +61,8 @@ const synonymGroups = [
 ]
 const synonymMap = new Map(synonymGroups.flatMap(group => group.map(term => [term, group] as const)))
 function normalizeSearch(value: string) { return value.toLocaleLowerCase().replace(/[\s\u3000]+/g, '') }
-function fuzzyMatch(needle: string, haystack: string) {
-  const target = normalizeSearch(needle)
-  const text = normalizeSearch(haystack)
+// 归一化文本可以复用：调用方传入已归一化的 target/text，避免每条文章重复归一化。
+function fuzzyMatchNormalized(target: string, text: string) {
   if (!target) return true
   if (text.includes(target)) return true
   let cursor = 0
@@ -87,26 +88,37 @@ function fuzzyMatch(needle: string, haystack: string) {
   return false
 }
 function searchTerms(query: string) { return query.trim().split(/[\s,，、]+/).map(normalizeSearch).filter(Boolean) }
-function expandTerm(term: string) { return [term, ...(synonymMap.get(term) || [])].filter((value, index, values) => values.indexOf(value) === index) }
+const expandCache = new Map<string, string[]>()
+function expandTerm(term: string) {
+  const cached = expandCache.get(term)
+  if (cached) return cached
+  const values = [term, ...(synonymMap.get(term) || [])].filter((value, index, items) => items.indexOf(value) === index)
+  expandCache.set(term, values)
+  return values
+}
 function articleSearchText(article: Article) {
   const item = article as SearchableArticle
   return [item.title, item.sourceName, item.channel, item.dateText, item.content, item.body, item.summary, item.excerpt, item.description].filter(Boolean).join(' ')
 }
-function matchesSearch(article: Article, query: string, mode: SearchMode) {
-  const terms = searchTerms(query)
+// 搜索文本预索引：按文章 id 缓存「拼接 + 归一化」结果，避免每次按键对全量文章重做。
+function buildSearchIndex(articles: Article[]) {
+  const index = new Map<string, string>()
+  for (const article of articles) index.set(article.id, normalizeSearch(articleSearchText(article)))
+  return index
+}
+function matchesIndexedSearch(text: string, terms: string[], mode: SearchMode) {
   if (!terms.length) return true
-  const text = articleSearchText(article)
-  if (mode === 'contains') return terms.every(term => normalizeSearch(text).includes(term))
-  if (mode === 'fuzzy') return terms.every(term => fuzzyMatch(term, text))
-  return terms.every(term => expandTerm(term).some(candidate => fuzzyMatch(candidate, text)))
+  if (mode === 'contains') return terms.every(term => text.includes(term))
+  if (mode === 'fuzzy') return terms.every(term => fuzzyMatchNormalized(term, text))
+  return terms.every(term => expandTerm(term).some(candidate => fuzzyMatchNormalized(candidate, text)))
 }
 function exportCSV(articles: Article[]) {
   const escape = (value: string) => {
     const safe = /^[\s]*[=+@\-]/.test(value) ? `'${value}` : value
     return `"${safe.replace(/"/g, '""')}"`
   }
-  const rows = [['标题', '发布日期', '原始日期', '年份推断', '来源', '来源类型', '栏目', '原文链接'], ...articles.map(article => [
-    article.title, articleDay(article), article.dateText, article.dateInferred ? '是' : '否', article.sourceName,
+  const rows = [['标题', '发布日期', '原始日期', '来源', '来源类型', '栏目', '原文链接'], ...articles.map(article => [
+    article.title, articleDay(article), article.dateText, article.sourceName,
     article.sourceKind === 'college' ? '学院' : '部门', article.channel, article.url,
   ])]
   const blob = new Blob(['\uFEFF' + rows.map(row => row.map(escape).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8;' })
@@ -171,7 +183,12 @@ export default function App() {
   const [mobileNav, setMobileNav] = useState(false)
   const [toast, setToast] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
+  const sidebarRef = useRef<HTMLElement>(null)
   const runningRef = useRef(false)
+  // 输入框保持即时响应，实际的过滤/排序跟随延迟值执行。
+  const deferredQuery = useDeferredValue(query)
+  // 每次 render 只取一次「今天」，既省掉 filter 内每条文章各调一次，也让跨零点后能自愈。
+  const todayDay = localDate()
 
   const refresh = useCallback(async () => {
     try {
@@ -179,7 +196,7 @@ export default function App() {
       setSnapshot(data)
       runningRef.current = data.sync.running
       setConnectionError('')
-    } catch (error) { setConnectionError(errorMessage(error)) }
+    } catch (error) { runningRef.current = false; setConnectionError(errorMessage(error)) }
     finally { setLoading(false) }
   }, [])
 
@@ -206,6 +223,21 @@ export default function App() {
     return () => window.removeEventListener('keydown', keydown)
   }, [modal])
   useEffect(() => { setPage(1) }, [view, kind, query, searchMode, channel, sourceId, includedSources, excludedSources, range, sort])
+  // 窄屏下侧栏用 transform 移出视口，但仍在 Tab 序内；关闭时用 inert + aria-hidden 把它移出可交互树。
+  useEffect(() => {
+    const element = sidebarRef.current
+    if (!element) return
+    const media = window.matchMedia('(max-width: 760px)')
+    const sync = () => {
+      const hidden = media.matches && !mobileNav
+      element.inert = hidden
+      if (hidden) element.setAttribute('aria-hidden', 'true')
+      else element.removeAttribute('aria-hidden')
+    }
+    sync()
+    media.addEventListener('change', sync)
+    return () => media.removeEventListener('change', sync)
+  }, [mobileNav])
 
   const navigate = (nextView: View, nextKind: Kind = 'all') => {
     setView(nextView); setKind(nextKind); setSourceId('all'); setIncludedSources([]); setExcludedSources([]); setChannel('all'); setRange('all'); setQuery(''); setSearchMode('smart'); setPage(1); setMobileNav(false)
@@ -276,39 +308,49 @@ export default function App() {
   const channelCount = snapshot.sources.reduce((total, source) => total + source.channels.length, 0)
   const successSources = snapshot.sources.filter(source => source.status === 'success' || source.status === 'ok' || source.status === 'partial')
   const failedSources = snapshot.sources.filter(source => source.status === 'error' || source.status === 'partial')
-  const channels = useMemo(() => [...new Set(snapshot.articles.filter(article => (kind === 'all' || article.sourceKind === kind) && (sourceId === 'all' || article.sourceId === sourceId)).map(article => article.channel).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [snapshot.articles, kind, sourceId])
-  const sourceOptions = useMemo(() => snapshot.sources.filter(source => kind === 'all' || source.kind === kind).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')), [snapshot.sources, kind])
+  const channels = useMemo(() => [...new Set(snapshot.articles.filter(article => (kind === 'all' || article.sourceKind === kind) && (sourceId === 'all' || article.sourceId === sourceId)).map(article => article.channel).filter(Boolean))].sort((a, b) => zhCollator.compare(a, b)), [snapshot.articles, kind, sourceId])
+  const sourceOptions = useMemo(() => snapshot.sources.filter(source => kind === 'all' || source.kind === kind).sort((a, b) => zhCollator.compare(a.name, b.name)), [snapshot.sources, kind])
+  // 搜索文本预索引随文章集合变化才重建（每次 ~30 ms），按键时只做字符串包含/编辑距离比较。
+  const searchIndex = useMemo(() => buildSearchIndex(snapshot.articles), [snapshot.articles])
+  // 收藏只在 saved 视图参与过滤：非 saved 视图下该值为 null，点收藏不会触发全量重算。
+  const savedIds = useMemo(() => (view === 'saved' ? new Set(bookmarks) : null), [view, bookmarks])
   const filteredArticles = useMemo(() => {
     const cutoff = new Date()
     if (range !== 'all') cutoff.setDate(cutoff.getDate() - Number(range) + 1)
     const cutoffDay = localDate(cutoff)
-    return snapshot.articles.filter(article => {
-      if (view === 'saved' && !bookmarks.includes(article.id)) return false
+    const terms = searchTerms(deferredQuery)
+    const filtered = snapshot.articles.filter(article => {
+      if (savedIds && !savedIds.has(article.id)) return false
       if (kind !== 'all' && article.sourceKind !== kind) return false
       if (sourceId !== 'all' && article.sourceId !== sourceId) return false
       if (includedSources.length > 0 && !includedSources.includes(article.sourceId)) return false
       if (excludedSources.includes(article.sourceId)) return false
       if (channel !== 'all' && article.channel !== channel) return false
-      if (!matchesSearch(article, query, searchMode)) return false
-      if (range !== 'all' && (!article.date || articleDay(article) < cutoffDay || articleDay(article) > localDate())) return false
+      if (terms.length && !matchesIndexedSearch(searchIndex.get(article.id) || '', terms, searchMode)) return false
+      const day = articleDay(article)
+      if (range !== 'all' && (!day || day < cutoffDay || day > todayDay)) return false
       return true
-    }).sort((a, b) => {
-      if (!a.date && b.date) return 1
-      if (a.date && !b.date) return -1
-      const dateOrder = (a.date || '').localeCompare(b.date || '')
-      return (sort === 'newest' ? -dateOrder : dateOrder) || a.title.localeCompare(b.title, 'zh-CN')
     })
-  }, [snapshot.articles, view, kind, sourceId, includedSources, excludedSources, channel, query, searchMode, range, sort, bookmarks])
-  const filteredSources = useMemo(() => snapshot.sources.filter(source => {
-    if (kind !== 'all' && source.kind !== kind) return false
-    if (includedSources.length > 0 && !includedSources.includes(source.id)) return false
-    if (excludedSources.includes(source.id)) return false
-    const text = `${source.name} ${source.group} ${source.url}`
-    if (!query.trim()) return true
-    if (searchMode === 'contains') return searchTerms(query).every(term => normalizeSearch(text).includes(term))
-    if (searchMode === 'fuzzy') return searchTerms(query).every(term => fuzzyMatch(term, text))
-    return searchTerms(query).every(term => expandTerm(term).some(candidate => fuzzyMatch(candidate, text)))
-  }), [snapshot.sources, kind, query, searchMode, includedSources, excludedSources])
+    // 未来日期（常为原文标注的截止/有效期）不参与「最新」置顶：正常日期 → 日期未知 → 未来日期。
+    return filtered.sort((a, b) => {
+      const dayA = articleDay(a), dayB = articleDay(b)
+      const tierA = !dayA ? 1 : dayA > todayDay ? 2 : 0
+      const tierB = !dayB ? 1 : dayB > todayDay ? 2 : 0
+      if (tierA !== tierB) return tierA - tierB
+      if (dayA !== dayB) return sort === 'newest' ? (dayA < dayB ? 1 : -1) : (dayA < dayB ? -1 : 1)
+      return zhCollator.compare(a.title, b.title)
+    })
+  }, [snapshot.articles, searchIndex, savedIds, view, kind, sourceId, includedSources, excludedSources, channel, deferredQuery, searchMode, range, sort, todayDay])
+  const filteredSources = useMemo(() => {
+    const terms = searchTerms(deferredQuery)
+    return snapshot.sources.filter(source => {
+      if (kind !== 'all' && source.kind !== kind) return false
+      if (includedSources.length > 0 && !includedSources.includes(source.id)) return false
+      if (excludedSources.includes(source.id)) return false
+      if (!terms.length) return true
+      return matchesIndexedSearch(normalizeSearch(`${source.name} ${source.group} ${source.url}`), terms, searchMode)
+    })
+  }, [snapshot.sources, kind, deferredQuery, searchMode, includedSources, excludedSources])
   const pageCount = Math.max(1, Math.ceil(filteredArticles.length / PAGE_SIZE))
   const currentPage = Math.min(page, pageCount)
   const visibleArticles = filteredArticles.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
@@ -316,7 +358,7 @@ export default function App() {
   const hasFilters = !!query || channel !== 'all' || sourceId !== 'all' || includedSources.length > 0 || excludedSources.length > 0 || range !== 'all'
   const progress = snapshot.sync.total > 0 ? Math.min(100, Math.round(snapshot.sync.completed / snapshot.sync.total * 100)) : 0
   const coverage = snapshot.sources.length > 0 ? Math.round(successSources.length / snapshot.sources.length * 100) : 0
-  const todayCount = snapshot.articles.filter(article => articleDay(article) === localDate()).length
+  const todayCount = useMemo(() => snapshot.articles.filter(article => articleDay(article) === todayDay).length, [snapshot.articles, todayDay])
   const dateLabel = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())
   const pageTitle = view === 'sources' ? '从这里，连接每个来源。' : view === 'saved' ? '重要的信息，留在手边。' : '校园信息，一站汇集。'
   const pageSubtitle = view === 'sources' ? '一览成都大学各部门与学院，发现官网中的每一个公开栏目。' : view === 'saved' ? '为值得关注的消息留个位置，随时回看，轻松找到。' : '汇集各部门与学院的通知、动态，让每一条重要消息都不再错过。'
@@ -332,7 +374,7 @@ export default function App() {
 
   return <div className="app-shell">
     {mobileNav && <button className="sidebar-backdrop" onClick={() => setMobileNav(false)} aria-label="收起导航"/>}
-    <aside className={`sidebar ${mobileNav ? 'is-open' : ''}`} aria-label="主导航">
+    <aside className={`sidebar ${mobileNav ? 'is-open' : ''}`} aria-label="主导航" ref={sidebarRef}>
       <a className="brand" href="#" onClick={event => { event.preventDefault(); navigate('feed') }}><span className="brand-mark"><Icon name="graduation" size={27}/></span><span><strong>成大<span> · </span>信息集</strong><small>CDU INFORMATION HUB</small></span></a>
       <div className="sidebar-divider"/>
       <p className="nav-label">校园工作台 <span>WORKSPACE</span></p>
@@ -385,8 +427,10 @@ export default function App() {
               <div className="list-header"><span>标题 / 来源</span><span>发布日期</span></div>
               {loading ? <LoadingRows/> : visibleArticles.length ? <div className="article-list">{visibleArticles.map(article => {
                 const saved = bookmarks.includes(article.id)
-                const isToday = articleDay(article) === localDate()
-                return <article className="article-row" key={article.id}><span className={`article-dot ${article.sourceKind === 'college' ? 'college-dot' : ''}`}/><div className="article-main"><div className="article-title-wrap"><a className="article-title" {...outbound(article.url)}>{article.title}</a>{isToday && <span className="new-badge">今日</span>}</div><div className="article-meta"><button className={article.sourceKind === 'college' ? 'college-meta' : ''} onClick={() => { setSourceId(article.sourceId); setKind(article.sourceKind); setChannel('all') }}>{article.sourceName}</button><span className="meta-divider"/><button onClick={() => setChannel(article.channel)}>{article.channel || '未分类'}</button></div></div><div className="article-date"><time dateTime={article.date || undefined}>{articleDay(article) || '日期未标注'}</time>{article.dateInferred ? <span title={`原始日期：${article.dateText || '未提供'}；年份根据采集时间推断，请以原文为准。`}>年份推断</span> : !article.date && article.dateText ? <span title={article.dateText}>{article.dateText}</span> : null}</div><button className={`bookmark-button ${saved ? 'is-saved' : ''}`} aria-label={`${saved ? '取消收藏' : '收藏'}：${article.title}`} aria-pressed={saved} onClick={() => toggleBookmark(article)}><Icon name="bookmark" size={17}/></button></article>
+                const day = articleDay(article)
+                const isToday = day === todayDay
+                const isFuture = !!day && day > todayDay
+                return <article className="article-row" key={article.id}><span className={`article-dot ${article.sourceKind === 'college' ? 'college-dot' : ''}`}/><div className="article-main"><div className="article-title-wrap"><a className="article-title" {...outbound(article.url)}>{article.title}</a>{isToday && <span className="new-badge">今日</span>}</div><div className="article-meta"><button className={article.sourceKind === 'college' ? 'college-meta' : ''} onClick={() => { setSourceId(article.sourceId); setKind(article.sourceKind); setChannel('all') }}>{article.sourceName}</button><span className="meta-divider"/><button onClick={() => setChannel(article.channel)}>{article.channel || '未分类'}</button></div></div><div className="article-date"><time dateTime={article.date || undefined} title={isFuture ? '该日期晚于今天，可能是原文标注的截止日期' : undefined}>{day || '日期未标注'}</time>{!article.date && article.dateText ? <span title={article.dateText}>{article.dateText}</span> : null}</div><button className={`bookmark-button ${saved ? 'is-saved' : ''}`} aria-label={`${saved ? '取消收藏' : '收藏'}：${article.title}`} aria-pressed={saved} onClick={() => toggleBookmark(article)}><Icon name="bookmark" size={17}/></button></article>
               })}</div> : <EmptyState icon={view === 'saved' ? 'bookmark' : hasFilters ? 'search' : 'layers'} title={view === 'saved' && !hasFilters ? '把值得关注的信息收藏在这里' : hasFilters ? '没有找到匹配的信息' : snapshot.sync.running ? '正在汇集校园信息' : '校园信息，从第一次同步开始'} description={view === 'saved' && !hasFilters ? '点击信息右侧的书签，即可加入收藏。收藏记录保存在当前设备。' : hasFilters ? '试试更简短的关键词，或放宽栏目、时间与来源筛选条件。' : snapshot.sync.running ? '正在逐个访问学校部门与学院网站，获取标题、日期和原文链接。' : '连接成都大学的部门与学院网站，发现通知公告、新闻动态等公开栏目。'} action={hasFilters ? <button className="button button-outline" onClick={clearFilters}>清除筛选</button> : view === 'saved' ? <button className="button button-outline" onClick={() => navigate('feed')}>去浏览校园信息<Icon name="arrow" size={16}/></button> : <button className="button button-primary" disabled={busy || snapshot.sync.running || !!connectionError} onClick={() => void beginSync()}><Icon name="refresh" size={16} className={snapshot.sync.running ? 'spin' : ''}/>{snapshot.sync.running ? '同步进行中…' : '开始首次同步'}</button>}/>}<div className="pagination"><span>共 {number.format(filteredArticles.length)} 条{filteredArticles.length > 0 && <>，显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredArticles.length)}</>}</span><div><button disabled={currentPage <= 1} aria-label="上一页" onClick={() => setPage(currentPage - 1)}><Icon name="chevron" size={14} className="rotate-180"/></button><span><strong>{currentPage}</strong> / {pageCount}</span><button disabled={currentPage >= pageCount} aria-label="下一页" onClick={() => setPage(currentPage + 1)}><Icon name="chevron" size={14}/></button></div></div>
             </>}
           </section>
@@ -404,7 +448,7 @@ export default function App() {
       </main>
     </div>
 
-    {modal === 'sync' && <Dialog title="同步管理" subtitle="从官方目录发现来源，按设定范围获取各站点的公开信息。" close={() => setModal(null)}><div className="dialog-body"><div className="modal-status"><span className={`modal-status-icon ${snapshot.sync.running ? 'running' : ''}`}><Icon name={snapshot.sync.running ? 'refresh' : 'layers'} size={24} className={snapshot.sync.running ? 'spin' : ''}/></span><div><strong>{snapshot.sync.running ? '正在同步校园信息' : '随时可以开始新的同步'}</strong><p>{snapshot.sync.running ? snapshot.sync.current || '正在发现来源…' : `最近完成：${formatTime(snapshot.sync.finishedAt)}`}</p></div></div>{snapshot.sync.running && <div className="modal-progress"><div className="progress-label"><span>{snapshot.sync.phase || '同步中'}</span><strong>{snapshot.sync.completed} / {snapshot.sync.total || '—'}</strong></div><div className="progress-track"><span style={{ width: `${Math.max(progress, 2)}%` }}/></div></div>}<div className="settings-heading"><Icon name="settings" size={18}/><h3>采集范围</h3></div><div className="settings-grid"><label><span>每个栏目采集页数</span><div className="number-input"><input type="number" min={1} max={50} step={1} value={options.pagesPerChannel} disabled={snapshot.sync.running} onChange={event => setOptions({ ...options, pagesPerChannel: Number(event.target.value) })}/><span>页</span></div><small>1–50 页，默认 2 页</small></label><label><span>每个来源最多栏目数</span><div className="number-input"><input type="number" min={1} max={100} step={1} value={options.maxChannelsPerSource} disabled={snapshot.sync.running} onChange={event => setOptions({ ...options, maxChannelsPerSource: Number(event.target.value) })}/><span>个</span></div><small>1–100 个，默认 40 个</small></label></div><p className="settings-help"><Icon name="info" size={16}/><span>采集范围为有限的历史页面；增大页数会延长同步时间。日期缺失会明确标注，推断的年份会单独提示。已获取的信息在停止同步后仍会保留。</span></p><button className="text-button settings-save" disabled={snapshot.sync.running} onClick={saveOptions}><Icon name="check" size={15}/>保存采集设置</button><div className="modal-metrics"><span>已发现来源<strong>{snapshot.sources.length}</strong></span><span>已发现栏目<strong>{channelCount}</strong></span><span>已汇集信息<strong>{number.format(snapshot.articles.length)}</strong></span></div>{(snapshot.sync.errors.length > 0 || failedSources.length > 0) && <details className="sync-errors"><summary><Icon name="warning" size={16}/>同步说明与失败记录<span>{snapshot.sync.errors.length + failedSources.length}<Icon name="chevronDown" size={14}/></span></summary><ul>{snapshot.sync.errors.map((error, index) => <li key={`sync-${index}`}>{error}</li>)}{failedSources.map(source => <li key={source.id}><strong>{source.name}</strong>{source.error || '部分内容未能获取，请重试。'}</li>)}</ul></details>}</div><div className="dialog-actions"><button className="button button-outline" onClick={() => setModal(null)}>返回浏览</button>{snapshot.sync.running ? <button className="button button-danger" disabled={busy} onClick={() => void stopSync()}><Icon name="stop" size={16}/>{busy ? '正在停止…' : '停止同步'}</button> : <button className="button button-primary" disabled={busy || loading || !!connectionError} onClick={() => void beginSync()}><Icon name="refresh" size={16}/>{busy ? '正在启动…' : '开始同步全部来源'}</button>}</div></Dialog>}
+    {modal === 'sync' && <Dialog title="同步管理" subtitle="从官方目录发现来源，按设定范围获取各站点的公开信息。" close={() => setModal(null)}><div className="dialog-body"><div className="modal-status"><span className={`modal-status-icon ${snapshot.sync.running ? 'running' : ''}`}><Icon name={snapshot.sync.running ? 'refresh' : 'layers'} size={24} className={snapshot.sync.running ? 'spin' : ''}/></span><div><strong>{snapshot.sync.running ? '正在同步校园信息' : '随时可以开始新的同步'}</strong><p>{snapshot.sync.running ? snapshot.sync.current || '正在发现来源…' : `最近完成：${formatTime(snapshot.sync.finishedAt)}`}</p></div></div>{snapshot.sync.running && <div className="modal-progress"><div className="progress-label"><span>{snapshot.sync.phase || '同步中'}</span><strong>{snapshot.sync.completed} / {snapshot.sync.total || '—'}</strong></div><div className="progress-track"><span style={{ width: `${Math.max(progress, 2)}%` }}/></div></div>}<div className="settings-heading"><Icon name="settings" size={18}/><h3>采集范围</h3></div><div className="settings-grid"><label><span>每个栏目采集页数</span><div className="number-input"><input type="number" min={1} max={50} step={1} value={options.pagesPerChannel} disabled={snapshot.sync.running} onChange={event => setOptions({ ...options, pagesPerChannel: Number(event.target.value) })}/><span>页</span></div><small>1–50 页，默认 2 页</small></label><label><span>每个来源最多栏目数</span><div className="number-input"><input type="number" min={1} max={100} step={1} value={options.maxChannelsPerSource} disabled={snapshot.sync.running} onChange={event => setOptions({ ...options, maxChannelsPerSource: Number(event.target.value) })}/><span>个</span></div><small>1–100 个，默认 40 个</small></label></div><p className="settings-help"><Icon name="info" size={16}/><span>采集范围为有限的历史页面；增大页数会延长同步时间。日期缺失会明确标注，保留原文月日，请以原文为准。已获取的信息在停止同步后仍会保留。</span></p><button className="text-button settings-save" disabled={snapshot.sync.running} onClick={saveOptions}><Icon name="check" size={15}/>保存采集设置</button><div className="modal-metrics"><span>已发现来源<strong>{snapshot.sources.length}</strong></span><span>已发现栏目<strong>{channelCount}</strong></span><span>已汇集信息<strong>{number.format(snapshot.articles.length)}</strong></span></div>{(snapshot.sync.errors.length > 0 || failedSources.length > 0) && <details className="sync-errors"><summary><Icon name="warning" size={16}/>同步说明与失败记录<span>{snapshot.sync.errors.length + failedSources.length}<Icon name="chevronDown" size={14}/></span></summary><ul>{snapshot.sync.errors.map((error, index) => <li key={`sync-${index}`}>{error}</li>)}{failedSources.map(source => <li key={source.id}><strong>{source.name}</strong>{source.error || '部分内容未能获取，请重试。'}</li>)}</ul></details>}</div><div className="dialog-actions"><button className="button button-outline" onClick={() => setModal(null)}>返回浏览</button>{snapshot.sync.running ? <button className="button button-danger" disabled={busy} onClick={() => void stopSync()}><Icon name="stop" size={16}/>{busy ? '正在停止…' : '停止同步'}</button> : <button className="button button-primary" disabled={busy || loading || !!connectionError} onClick={() => void beginSync()}><Icon name="refresh" size={16}/>{busy ? '正在启动…' : '开始同步全部来源'}</button>}</div></Dialog>}
     {modal === 'about' && <Dialog title="成大 · 信息集" subtitle="把散落在校园各处的公开消息，汇集到一个安静、有序的地方。" close={() => setModal(null)}><div className="dialog-body about-body"><div className="about-brand"><Icon name="graduation" size={36}/><span>校园信息，一站汇集。</span></div><p>信息集通过成都大学官方组织机构与院系设置页面发现各部门、学院的公开网站，自动识别通知公告、新闻动态等栏目，保存信息标题、日期与原文链接。</p><p>它是独立的信息聚合工具，并非成都大学官方网站。信息以原发布网站为准，公开目录中的失效或未提供链接会在来源目录中标明。收藏保存在当前浏览器或桌面应用的本地存储中。</p><div className="about-links"><a {...outbound('https://www.cdu.edu.cn/zzjg.htm')}><Icon name="building" size={17}/>组织机构目录<Icon name="external" size={13}/></a><a {...outbound('https://www.cdu.edu.cn/yxsz.htm')}><Icon name="graduation" size={17}/>院系设置目录<Icon name="external" size={13}/></a></div></div><div className="dialog-actions"><button className="button button-primary" onClick={() => setModal(null)}>开始探索<Icon name="arrow" size={16}/></button></div></Dialog>}
     {toast && <div className="toast" role="status"><span>{toast}</span><button aria-label="关闭提示" onClick={() => setToast('')}><Icon name="close" size={15}/></button></div>}
   </div>

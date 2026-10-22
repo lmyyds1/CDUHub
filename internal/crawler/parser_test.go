@@ -74,7 +74,7 @@ func TestArticleDatesAndTitlesStayAttachedToTheirRows(t *testing.T) {
 	if items[0].Title != "关于2026年9月1日活动报名的完整通知" || items[0].Date != "2026-09-14" {
 		t.Errorf("wrong full title or publication date: %+v", items[0])
 	}
-	if items[1].Date != "" || items[1].DateText != "09-03" || items[1].DateInferred {
+	if items[1].Date != "" || items[1].DateText != "09-03" {
 		t.Errorf("year was invented: %+v", items[1])
 	}
 	if items[2].Date != "" || items[2].DateText != "" {
@@ -308,5 +308,151 @@ func TestTitleStructurePreservesLegitimateLongHeadline(t *testing.T) {
 	items := parseArticles(parseFixture(t, body), "https://lib.cdu.edu.cn/", model.Source{ID: "lib"}, "资讯动态", "")
 	if len(items) != 1 || items[0].Title != longTitle {
 		t.Fatalf("legitimate scientific title was shortened or polluted: %+v", items)
+	}
+}
+
+// A trial-database page prints its validity period in the headline while the
+// real publication date sits in a sibling block below it. lib.cdu.edu.cn/info/1057/1571.htm
+// was recorded as 2026-12-31 instead of 2022-05-16 because the headline container
+// matched the old "class contains info" check first.
+func TestDetailPrefersPublicationDateOverHeadlineValidityPeriod(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, wantDate, wantOriginal string
+	}{
+		{
+			name: "headline container before news metadata",
+			body: `<body><div class="infotitle">古扬“外文学术资源整合服务系统”（试用有效期：即日起--2026年12月31日）</div>
+<div class="bodycon"><div class="newsinfo">来源： 发布时间：2022-05-16 编辑：技术部 浏览数：</div></div>
+<div id="vsb_content" class="bodycon"><div class="v_news_content"><p>试用期限：即日起--2026年12月31日</p></div></div></body>`,
+			wantDate: "2022-05-16", wantOriginal: "2022-05-16",
+		},
+		{
+			name: "headline and deadline in one container",
+			body: `<body><div class="pagew"><div class="infotitle">Mirror（米乐）心理资源服务平台（试用有效期：即日起--2026年12月31日）</div>
+<div class="newsinfo">发布时间：2022-03-01 编辑：钟涛</div></div></body>`,
+			wantDate: "2022-03-01", wantOriginal: "2022-03-01",
+		},
+		{
+			name:     "only a validity period is shown",
+			body:     `<body><div class="infotitle">广益多媒体外语学习平台（试用有效期：即日起--2026年3月1日）</div></body>`,
+			wantDate: "", wantOriginal: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, date, original := detailMetadata(parseFixture(t, tc.body))
+			if date != tc.wantDate || original != tc.wantOriginal {
+				t.Fatalf("wanted (%q,%q), got (%q,%q)", tc.wantDate, tc.wantOriginal, date, original)
+			}
+		})
+	}
+}
+
+// journal.cdu.edu.cn renders three policy documents side by side. None of them
+// shows a publication date, so the old 5-level ancestor walk stole the first
+// date it found in a neighbouring row's summary and reported 1998-04-01.
+func TestListDateDoesNotLeakFromSiblingRows(t *testing.T) {
+	body := `<div class="s4-main"><div>
+<div class="s4-con"><a href="info/1058/1332.htm"><h4>《期刊出版管理规定》</h4><p class="overs eclip2">新闻出版总署令第31号发布，2005年12月1日施行。</p></a></div>
+<div class="s4-con"><a href="info/1058/1333.htm"><h4>《高等学校学报管理办法》</h4><p class="overs eclip2">教育部1998年4月1日发布，1998年5月1日起实行。</p></a></div>
+<div class="s4-con"><a href="info/1058/1334.htm"><h4>关于进一步加强和改进高校出版工作的意见</h4><p class="overs eclip2">各省、自治区、直辖市教育厅（教委）：</p></a></div>
+</div></div>`
+	items := parseArticles(parseFixture(t, body), "https://journal.cdu.edu.cn/", model.Source{ID: "journal"}, "政策法规", "")
+	if len(items) != 3 {
+		t.Fatalf("wanted 3 policy documents, got %d", len(items))
+	}
+	for _, item := range items {
+		if item.Date != "" || item.DateText != "" {
+			t.Errorf("sibling summary date leaked into %s: %+v", item.URL, item)
+		}
+	}
+}
+
+// A row that prints an event date in its summary and the publication date in a
+// separate span must report the span, not the event date.
+func TestRowSummaryEventDateIsNotUsedAsPublicationDate(t *testing.T) {
+	body := `<ul><li><a href="info/1046/12227.htm">“2026年成都大学科研成果转化与技术创新国际会议”会议服务项目比选公告</a>
+<div class="txt-right-p">现将有关事项公告如下，会议将于2026年11月13日在成都大学举办。</div><span class="date">2026-09-24</span></li></ul>`
+	items := parseArticles(parseFixture(t, body), "https://jxgc.cdu.edu.cn/", model.Source{ID: "jxgc"}, "通知公告", "")
+	if len(items) != 1 {
+		t.Fatalf("wanted 1 article, got %d", len(items))
+	}
+	if items[0].Date != "2026-09-24" {
+		t.Errorf("event date was used as publication date: %+v", items[0])
+	}
+}
+
+// A split-block date span is parsed correctly, but some templates repeat the
+// same date as ISO text inside the headline. Only the duplicate is removed.
+func TestHeadlineEdgeDateDuplicateIsTrimmed(t *testing.T) {
+	body := `<ul><li><a href="info/1046/12201.htm">成都大学科学技术项目协作外拨事项公示 2026-09-14</a>
+<div class="pull-left txt-date text-center"><span>14</span><br>2026-09</div></li></ul>`
+	items := parseArticles(parseFixture(t, body), "https://jxgc.cdu.edu.cn/", model.Source{ID: "jxgc"}, "通知公告", "")
+	if len(items) != 1 {
+		t.Fatalf("wanted 1 article, got %d", len(items))
+	}
+	if items[0].Date != "2026-09-14" {
+		t.Errorf("split date not parsed: %+v", items[0])
+	}
+	if items[0].Title != "成都大学科学技术项目协作外拨事项公示" {
+		t.Errorf("duplicate headline date not trimmed: %q", items[0].Title)
+	}
+	// A date that is part of the headline itself must survive.
+	body = `<ul><li><a href="info/1046/12000.htm">关于2026年9月14日开展消防演练的通知</a><span class="date">2026-09-10</span></li></ul>`
+	items = parseArticles(parseFixture(t, body), "https://jxgc.cdu.edu.cn/", model.Source{ID: "jxgc"}, "通知公告", "")
+	if len(items) != 1 || items[0].Title != "关于2026年9月14日开展消防演练的通知" {
+		t.Errorf("headline date inside the title was removed: %+v", items)
+	}
+}
+
+// jxgc 首页 puts the publication date inside the article anchor with no markup
+// of its own, so it used to become part of the headline while the record was
+// left without a date at all.
+func TestDateInsideArticleAnchorBecomesPublicationDate(t *testing.T) {
+	body := `<ul><li><a class="txt-elise" href="info/1047/12208.htm">【迎新工作】机械工程学院圆满完成2026级迎新工作<span>2026-09-15</span></a></li></ul>`
+	items := parseArticles(parseFixture(t, body), "https://jxgc.cdu.edu.cn/", model.Source{ID: "jxgc"}, "首页动态", "")
+	if len(items) != 1 {
+		t.Fatalf("wanted 1 article, got %d", len(items))
+	}
+	if items[0].Date != "2026-09-15" || items[0].DateText != "2026-09-15" {
+		t.Errorf("date inside the anchor was not recovered: %+v", items[0])
+	}
+	if items[0].Title != "【迎新工作】机械工程学院圆满完成2026级迎新工作" {
+		t.Errorf("anchor date was left in the headline: %q", items[0].Title)
+	}
+	// A headline whose trailing number is not a calendar date stays untouched.
+	body = `<ul><li><a href="info/1047/12209.htm">关于2026级新生报到的通知 2026-13-45</a></li></ul>`
+	items = parseArticles(parseFixture(t, body), "https://jxgc.cdu.edu.cn/", model.Source{ID: "jxgc"}, "首页动态", "")
+	if len(items) != 1 || items[0].Date != "" || !strings.HasSuffix(items[0].Title, "2026-13-45") {
+		t.Errorf("invalid trailing date was treated as a publication date: %+v", items)
+	}
+}
+
+// bs.cdu.edu.cn wraps the headline and the date in one anchor, the date living
+// in a bare <span> with no class of its own.
+func TestBareDateElementInsideAnchorIsPublicationDate(t *testing.T) {
+	body := `<div class="list"><a href="info/1110/13266.htm"><p>西南财经大学-罗格斯大学-成都大学会计联合研讨会成功举办</p><span>2026-10-19</span><div class="clear"></div></a></div>`
+	items := parseArticles(parseFixture(t, body), "https://bs.cdu.edu.cn/", model.Source{ID: "bs"}, "首页动态", "")
+	if len(items) != 1 {
+		t.Fatalf("wanted 1 article, got %d", len(items))
+	}
+	if items[0].Date != "2026-10-19" {
+		t.Errorf("bare date element not used as publication date: %+v", items[0])
+	}
+	if strings.Contains(items[0].Title, "2026-10-19") {
+		t.Errorf("date leaked into the headline: %q", items[0].Title)
+	}
+}
+
+// A row whose only date-like text is a deadline keeps an empty date instead of
+// reporting the deadline as the publication date.
+func TestDeadlineOnlyRowKeepsNoDate(t *testing.T) {
+	body := `<ul><li><a href="info/1012/1473.htm">关于魔方数独协会“魔方进小区”志愿活动的通知</a>
+<div class="desc">活动将于2023年10月28日14:00至17:00在书香邻里书屋开展，报名截止2023年10月26日。</div></li></ul>`
+	items := parseArticles(parseFixture(t, body), "https://sqjsb.cdu.edu.cn/", model.Source{ID: "sqjsb"}, "通知公告", "")
+	if len(items) != 1 {
+		t.Fatalf("wanted 1 article, got %d", len(items))
+	}
+	if items[0].Date != "" {
+		t.Errorf("deadline was used as publication date: %+v", items[0])
 	}
 }

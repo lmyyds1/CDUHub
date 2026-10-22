@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
@@ -32,7 +33,7 @@ func Handler(s *service.Service, assets fs.FS) http.Handler {
 			return
 		}
 		if err := s.Start(*options); err != nil {
-			respond(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			respond(w, statusForError(err), map[string]string{"error": err.Error()})
 			return
 		}
 		respond(w, http.StatusAccepted, map[string]bool{"ok": true})
@@ -57,7 +58,35 @@ func Handler(s *service.Service, assets fs.FS) http.Handler {
 		}
 		files.ServeHTTP(w, r)
 	})
-	return mux
+	return withRecovery(mux)
+}
+
+// withRecovery 兜住 handler 内的 panic，返回统一的 JSON 500，
+// 而不是让连接被直接掐断、前端只看到网络错误。
+func withRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				respond(w, http.StatusInternalServerError, map[string]string{"error": "服务器内部错误"})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// statusForError 把 service 的哨兵错误映射为 HTTP 状态码：
+// 409 任务已在运行/服务已关闭，400 参数非法，404 来源不存在，其余 500。
+func statusForError(err error) int {
+	switch {
+	case errors.Is(err, service.ErrSyncRunning), errors.Is(err, service.ErrClosed):
+		return http.StatusConflict
+	case errors.Is(err, service.ErrInvalidOptions):
+		return http.StatusBadRequest
+	case errors.Is(err, service.ErrSourceNotFound):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func sameOrigin(r *http.Request) bool {

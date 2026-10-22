@@ -58,9 +58,13 @@ func main() {
 	srv := &http.Server{Addr: *addr, Handler: server.Handler(svc, assets), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
+		// 先取消正在进行的抓取，再关 HTTP：否则长抓取会把退出拖到 Shutdown 超时之后。
+		svc.Cancel()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdown)
+		if err := srv.Shutdown(shutdown); err != nil {
+			log.Printf("HTTP 服务关闭未在超时内完成: %v", err)
+		}
 	}()
 	log.Printf("成大信息汇已启动: http://%s", *addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

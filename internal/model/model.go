@@ -20,18 +20,17 @@ type Source struct {
 }
 
 type Article struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	Content      string `json:"content,omitempty"`
-	URL          string `json:"url"`
-	SourceID     string `json:"sourceId"`
-	SourceName   string `json:"sourceName"`
-	SourceKind   string `json:"sourceKind"`
-	Channel      string `json:"channel"`
-	Date         string `json:"date"`
-	DateText     string `json:"dateText"`
-	DateInferred bool   `json:"dateInferred"`
-	FetchedAt    string `json:"fetchedAt"`
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Content    string `json:"content,omitempty"`
+	URL        string `json:"url"`
+	SourceID   string `json:"sourceId"`
+	SourceName string `json:"sourceName"`
+	SourceKind string `json:"sourceKind"`
+	Channel    string `json:"channel"`
+	Date       string `json:"date"`
+	DateText   string `json:"dateText"`
+	FetchedAt  string `json:"fetchedAt"`
 }
 
 type SyncStatus struct {

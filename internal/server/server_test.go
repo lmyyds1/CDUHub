@@ -3,16 +3,23 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"cduhub/internal/model"
 	"cduhub/internal/service"
 )
+
+// panicFS 用于验证 HTTP handler 的 panic 恢复中间件。
+type panicFS struct{}
+
+func (panicFS) Open(string) (fs.File, error) { panic("assets exploded") }
 
 type countingCollector struct{ calls atomic.Int32 }
 
@@ -122,6 +129,60 @@ func TestSameOriginSyncAndSnapshotContract(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://localhost:34115/api/cancel", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("same-origin cancellation returned %d", response.Code)
+	}
+}
+
+func TestSyncErrorStatusesAreDistinguished(t *testing.T) {
+	handler, s, collector := testHandler(t)
+
+	// 参数非法 -> 400（不再是 409）
+	post := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "http://localhost:34115/api/sync", strings.NewReader(body))
+		request.Header.Set("Origin", "http://localhost:34115")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := post(`{"pagesPerChannel":501}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid options should be 400, got %d body=%s", response.Code, response.Body.String())
+	}
+	if response := post(`{"maxChannelsPerSource":201}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid channel limit should be 400, got %d", response.Code)
+	}
+	// 来源不存在 -> 404
+	if response := post(`{"sourceId":"not-exist"}`); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown source should be 404, got %d body=%s", response.Code, response.Body.String())
+	}
+	// 任务已在运行 -> 409
+	if response := post(`{}`); response.Code != http.StatusAccepted {
+		t.Fatalf("first sync should be accepted, got %d body=%s", response.Code, response.Body.String())
+	}
+	if response := post(`{}`); response.Code != http.StatusConflict {
+		t.Fatalf("overlapping sync should be 409, got %d", response.Code)
+	}
+	s.Cancel()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Snapshot().Sync.Running {
+		if time.Now().After(deadline) {
+			t.Fatal("sync did not stop after cancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if collector.calls.Load() != 1 {
+		t.Fatalf("invalid requests must not reach the collector: %d discovery calls", collector.calls.Load())
+	}
+}
+
+func TestHandlerRecoversFromPanic(t *testing.T) {
+	_, s, _ := testHandler(t)
+	handler := Handler(s, panicFS{})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost:34115/", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("panicking handler should return 500, got %d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Header().Get("Content-Type"), "application/json") || !strings.Contains(response.Body.String(), "error") {
+		t.Fatalf("panic response is not a JSON error: %v %s", response.Header(), response.Body.String())
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -72,7 +73,7 @@ func TestIncrementalSyncPreservesDatesAndPersistsAcrossRestart(t *testing.T) {
 			if calls.Add(1) == 1 {
 				s.Channels = []model.Channel{channel}
 				return s, []model.Article{
-					{ID: "a", SourceID: s.ID, Title: "原始标题", Date: "2026-09-13", DateText: "2026年9月13日", DateInferred: true},
+					{ID: "a", SourceID: s.ID, Title: "原始标题", Date: "2026-09-13", DateText: "2026年9月13日"},
 					{ID: "old", SourceID: s.ID, Title: "历史通知", Date: "2025-01-02", DateText: "2025-01-02"},
 				}, nil
 			}
@@ -101,7 +102,7 @@ func TestIncrementalSyncPreservesDatesAndPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("articles should be ordered by publication date, got %v", got)
 	}
 	updated := snapshot.Articles[1]
-	if updated.Title != "更新后的标题" || updated.Date != "2026-09-13" || updated.DateText != "2026年9月13日" || !updated.DateInferred {
+	if updated.Title != "更新后的标题" || updated.Date != "2026-09-13" || updated.DateText != "2026年9月13日" {
 		t.Fatalf("refresh should update title without degrading a known full date: %+v", updated)
 	}
 	if !reflect.DeepEqual(snapshot.Sources[0].Channels, []model.Channel{channel}) {
@@ -218,18 +219,264 @@ func TestConcurrentStartAllowsOneRunAndCancelAllowsRestart(t *testing.T) {
 func TestStartRejectsInvalidOptionsBeforeCallingCollector(t *testing.T) {
 	var calls atomic.Int32
 	s := newTestService(t, "", fakeCollector{discover: func(context.Context) ([]model.Source, []string) { calls.Add(1); return nil, nil }})
-	for _, options := range []model.SyncOptions{
-		{PagesPerChannel: -1}, {PagesPerChannel: 501},
-		{MaxChannelsPerSource: -1}, {MaxChannelsPerSource: 201},
-		{SourceID: "unknown"},
+	for _, tc := range []struct {
+		options model.SyncOptions
+		want    error
+	}{
+		{model.SyncOptions{PagesPerChannel: -1}, ErrInvalidOptions},
+		{model.SyncOptions{PagesPerChannel: 501}, ErrInvalidOptions},
+		{model.SyncOptions{MaxChannelsPerSource: -1}, ErrInvalidOptions},
+		{model.SyncOptions{MaxChannelsPerSource: 201}, ErrInvalidOptions},
+		{model.SyncOptions{SourceID: "unknown"}, ErrSourceNotFound},
 	} {
-		if err := s.Start(options); err == nil {
-			t.Errorf("accepted invalid options: %+v", options)
+		err := s.Start(tc.options)
+		if err == nil {
+			t.Errorf("accepted invalid options: %+v", tc.options)
+			continue
+		}
+		if !errors.Is(err, tc.want) {
+			t.Errorf("options %+v: error %v is not %v", tc.options, err, tc.want)
 		}
 	}
 	if calls.Load() != 0 || s.Snapshot().Sync.Running {
 		t.Fatal("invalid request started a crawl")
 	}
+}
+
+func TestStartAfterCloseIsRejected(t *testing.T) {
+	s := newTestService(t, "", fakeCollector{})
+	s.Close()
+	if err := s.Start(model.SyncOptions{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("start after close should report ErrClosed, got %v", err)
+	}
+	s.Close() // 幂等，不能 panic 或阻塞
+}
+
+func TestCollectorPanicIsRecoveredAndMarksRunFailed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	s := newTestService(t, path, fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) {
+			return []model.Source{{ID: "boom", Name: "会崩溃的来源"}, {ID: "fine", Name: "正常来源"}}, nil
+		},
+		crawl: func(_ context.Context, source model.Source, _ model.SyncOptions) (model.Source, []model.Article, error) {
+			if source.ID == "boom" {
+				panic("collector exploded")
+			}
+			source.Status = "ok"
+			return source, []model.Article{{ID: "fine-article", SourceID: source.ID, Title: "正常通知"}}, nil
+		},
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := awaitSync(t, s)
+	if snapshot.Sync.Running || snapshot.Sync.Phase != "error" {
+		t.Fatalf("a panicking source must end the round as error, not completed: %+v", snapshot.Sync)
+	}
+	joined := strings.Join(snapshot.Sync.Errors, "\n")
+	if !strings.Contains(joined, "采集程序异常") || !strings.Contains(joined, "collector exploded") {
+		t.Fatalf("panic was not recorded in sync errors: %q", joined)
+	}
+	if len(snapshot.Articles) != 1 || snapshot.Articles[0].ID != "fine-article" {
+		t.Fatalf("healthy source results were lost after a panic: %+v", snapshot.Articles)
+	}
+	// 磁盘上也不能谎称这一轮正常完成，否则重启后中断/失败不可见。
+	restarted := newTestService(t, path, fakeCollector{}).Snapshot()
+	if restarted.Sync.Running || restarted.Sync.Phase != "error" {
+		t.Fatalf("persisted state hides the panic: %+v", restarted.Sync)
+	}
+	for _, source := range restarted.Sources {
+		if source.ID == "boom" && source.Status != "error" {
+			t.Errorf("panicking source should be marked error: %+v", source)
+		}
+	}
+}
+
+func TestDiscoverPanicIsRecovered(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	s := newTestService(t, path, fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) { panic("directory exploded") },
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := awaitSync(t, s)
+	if snapshot.Sync.Running || snapshot.Sync.Phase != "error" || !strings.Contains(strings.Join(snapshot.Sync.Errors, "\n"), "directory exploded") {
+		t.Fatalf("discovery panic not recovered as error phase: %+v", snapshot.Sync)
+	}
+	if restarted := newTestService(t, path, fakeCollector{}).Snapshot(); restarted.Sync.Phase != "error" {
+		t.Fatalf("persisted phase should stay error, got %q", restarted.Sync.Phase)
+	}
+}
+
+func TestCloseHasBoundedWaitWhenCollectorIgnoresContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s := newTestService(t, filepath.Join(t.TempDir(), "snapshot.json"), fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) {
+			return []model.Source{{ID: "stuck", Name: "不响应取消的来源"}}, nil
+		},
+		crawl: func(context.Context, model.Source, model.SyncOptions) (model.Source, []model.Article, error) {
+			close(started)
+			<-release // 刻意忽略 ctx
+			return model.Source{}, nil, errors.New("released")
+		},
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("collector never started")
+	}
+	begin := time.Now()
+	s.closeWithTimeout(200 * time.Millisecond)
+	if elapsed := time.Since(begin); elapsed > 3*time.Second {
+		t.Fatalf("Close waited %v without bound", elapsed)
+	}
+	close(release)
+	awaitSync(t, s) // 让后台 run 收尾，避免测试结束时有 goroutine 在跑
+}
+
+func TestPersistFailuresSurfaceAsErrorPhase(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestService(t, filepath.Join(blocker, "snapshot.json"), fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) {
+			return []model.Source{{ID: "office", Name: "办公室"}}, nil
+		},
+		crawl: func(_ context.Context, source model.Source, _ model.SyncOptions) (model.Source, []model.Article, error) {
+			source.Status = "ok"
+			return source, []model.Article{{ID: "a", SourceID: source.ID, Title: "通知"}}, nil
+		},
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := awaitSync(t, s)
+	if snapshot.Sync.Phase != "error" || !strings.Contains(strings.Join(snapshot.Sync.Errors, "\n"), "保存失败") {
+		t.Fatalf("unwritable path should surface as error phase: %+v", snapshot.Sync)
+	}
+	if len(snapshot.Articles) != 1 {
+		t.Fatalf("in-memory results should survive a failed save: %+v", snapshot.Articles)
+	}
+}
+
+func TestSaveIsThrottledAcrossSourceCompletions(t *testing.T) {
+	sources := make([]model.Source, 0, 8)
+	for i := 0; i < 8; i++ {
+		sources = append(sources, model.Source{ID: fmt.Sprintf("s%d", i), Name: fmt.Sprintf("来源 %d", i), Status: "pending"})
+	}
+	s := newTestService(t, filepath.Join(t.TempDir(), "snapshot.json"), fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) { return sources, nil },
+		crawl: func(_ context.Context, source model.Source, _ model.SyncOptions) (model.Source, []model.Article, error) {
+			source.Status = "ok"
+			return source, []model.Article{{ID: source.ID + "-a", SourceID: source.ID, Title: "通知"}}, nil
+		},
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := awaitSync(t, s)
+	if snapshot.Sync.Phase != "completed" || snapshot.Sync.Completed != len(sources) {
+		t.Fatalf("sync did not complete: %+v", snapshot.Sync)
+	}
+
+	s.mu.RLock()
+	writes := s.saveWrites
+	s.mu.RUnlock()
+	if writes == 0 {
+		t.Fatal("final state was never written to disk")
+	}
+	if writes >= uint64(len(sources)) {
+		t.Fatalf("save throttle ineffective: %d writes for %d source completions", writes, len(sources))
+	}
+}
+
+func TestIncrementalIndexSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	round := atomic.Int32{}
+	collector := fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) {
+			return []model.Source{{ID: "office", Name: "办公室", Status: "pending"}}, nil
+		},
+		crawl: func(_ context.Context, source model.Source, _ model.SyncOptions) (model.Source, []model.Article, error) {
+			source.Status = "ok"
+			if round.Add(1) == 1 {
+				return source, []model.Article{
+					{ID: "a", SourceID: source.ID, Title: "第一条", Date: "2026-09-01"},
+					{ID: "b", SourceID: source.ID, Title: "第二条", Date: "2026-09-02"},
+				}, nil
+			}
+			return source, []model.Article{
+				{ID: "a", SourceID: source.ID, Title: "第一条（更新）", Date: "2026-09-01"},
+				{ID: "c", SourceID: source.ID, Title: "第三条", Date: "2026-09-03"},
+			}, nil
+		},
+	}
+	s := newTestService(t, path, collector)
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	awaitSync(t, s)
+
+	// 重启后索引与计数必须由磁盘状态重建，而不是继续沿用旧内存。
+	restarted := newTestService(t, path, collector)
+	if err := restarted.Start(model.SyncOptions{SourceID: "office"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := awaitSync(t, restarted)
+	if len(snapshot.Articles) != 3 {
+		t.Fatalf("duplicate articles after restart: %+v", snapshot.Articles)
+	}
+	if snapshot.Sources[0].ArticleCount != 3 {
+		t.Fatalf("article count not maintained per source: %+v", snapshot.Sources[0])
+	}
+	if got := []string{snapshot.Articles[0].ID, snapshot.Articles[1].ID, snapshot.Articles[2].ID}; !reflect.DeepEqual(got, []string{"c", "b", "a"}) {
+		t.Fatalf("snapshot should stay ordered by date, got %v", got)
+	}
+	if snapshot.Articles[2].Title != "第一条（更新）" {
+		t.Fatalf("refresh did not update the existing article: %+v", snapshot.Articles[2])
+	}
+}
+
+func TestConcurrentSnapshotSurvivesSync(t *testing.T) {
+	s := newTestService(t, filepath.Join(t.TempDir(), "snapshot.json"), fakeCollector{
+		discover: func(context.Context) ([]model.Source, []string) {
+			return []model.Source{{ID: "a", Name: "甲"}, {ID: "b", Name: "乙"}}, nil
+		},
+		crawl: func(_ context.Context, source model.Source, _ model.SyncOptions) (model.Source, []model.Article, error) {
+			source.Status = "ok"
+			return source, []model.Article{{ID: source.ID + "-article", SourceID: source.ID, Title: "通知", Date: "2026-09-14"}}, nil
+		},
+	})
+	if err := s.Start(model.SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if snapshot := s.Snapshot(); len(snapshot.Articles) > 2 {
+					t.Error("snapshot returned more articles than exist")
+					return
+				}
+			}
+		}
+	}()
+	awaitSync(t, s)
+	close(stop)
+	readers.Wait()
 }
 
 func TestCancellationKeepsAlreadySavedResults(t *testing.T) {
